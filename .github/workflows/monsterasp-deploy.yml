@@ -1,0 +1,125 @@
+name: Deploy to MonsterASP.NET
+
+on:
+  push:
+    branches: [main, master, principal]
+  workflow_dispatch:
+
+jobs:
+  build_and_deploy:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Prepare config and appsettings.Production.json
+        id: prep
+        shell: pwsh
+        env:
+          WEBSITE_NAME: ${{ secrets.WEBSITE_NAME }}
+          SERVER_COMPUTER_NAME: ${{ secrets.SERVER_COMPUTER_NAME }}
+          SERVER_USERNAME: ${{ secrets.SERVER_USERNAME }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+          CONNECTION_STRING: ${{ secrets.CONNECTION_STRING }}
+          JWT_SECRET_KEY: ${{ secrets.JWT_SECRET_KEY }}
+          AUTH_USERNAME: ${{ secrets.AUTH_USERNAME }}
+          AUTH_PASSWORD: ${{ secrets.AUTH_PASSWORD }}
+        run: |
+          $required = @(
+            'WEBSITE_NAME','SERVER_COMPUTER_NAME','SERVER_USERNAME','SERVER_PASSWORD',
+            'CONNECTION_STRING','JWT_SECRET_KEY','AUTH_USERNAME','AUTH_PASSWORD'
+          )
+          $missing = @($required | Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($missing.Count -gt 0) {
+            throw @"
+          Faltan Secrets (no Variables) en:
+          GitHub repo -> Settings -> Secrets and variables -> Actions -> Repository secrets
+
+          Faltan: $($missing -join ', ')
+          "@
+          }
+
+          if (Test-Path 'HackerRank1/HackerRank1.csproj') {
+            $csproj = 'HackerRank1/HackerRank1.csproj'
+            $publishPath = 'HackerRank1/publish'
+          } elseif (Test-Path 'HackerRank1.csproj') {
+            $csproj = 'HackerRank1.csproj'
+            $publishPath = 'publish'
+          } else {
+            throw 'No se encontro HackerRank1.csproj'
+          }
+
+          @(
+            "csproj=$csproj"
+            "publish_path=$publishPath"
+          ) | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
+
+          $projDir = Split-Path $csproj -Parent
+          if ([string]::IsNullOrEmpty($projDir)) { $projDir = '.' }
+
+          $settings = [ordered]@{
+            ConnectionStrings = [ordered]@{ DefaultConnection = $env:CONNECTION_STRING }
+            JwtSettings       = [ordered]@{
+              Issuer    = 'MyApp'
+              Audience  = 'library-api'
+              SecretKey = $env:JWT_SECRET_KEY
+            }
+            AuthCredentials   = [ordered]@{
+              Username = $env:AUTH_USERNAME
+              Password = $env:AUTH_PASSWORD
+              Role     = 'admin'
+            }
+            Cors    = [ordered]@{ Origins = 'http://localhost:5173,http://127.0.0.1:5173' }
+            Logging = [ordered]@{
+              LogLevel = [ordered]@{
+                Default = 'Information'
+                'Microsoft.AspNetCore' = 'Warning'
+              }
+            }
+          }
+          $outFile = Join-Path $projDir 'appsettings.Production.json'
+          $settings | ConvertTo-Json -Depth 6 | Set-Content -Path $outFile -Encoding utf8
+
+      - name: Restore
+        run: dotnet restore ${{ steps.prep.outputs.csproj }}
+
+      - name: Publish
+        run: dotnet publish ${{ steps.prep.outputs.csproj }} -c Release -o ${{ steps.prep.outputs.publish_path }} --runtime win-x86 --self-contained false
+
+      - name: Install Web Deploy 3.6
+        shell: pwsh
+        run: |
+          $msdeployCandidates = @(
+            "${env:ProgramFiles}\IIS\Microsoft Web Deploy V3\msdeploy.exe",
+            "${env:ProgramFiles(x86)}\IIS\Microsoft Web Deploy V3\msdeploy.exe"
+          )
+          if ($msdeployCandidates | Where-Object { Test-Path $_ }) {
+            Write-Host 'Web Deploy ya instalado.'
+            exit 0
+          }
+          $msi = Join-Path $env:RUNNER_TEMP 'WebDeploy_amd64_en-US.msi'
+          Invoke-WebRequest -Uri 'https://download.microsoft.com/download/0/1/D/01DC28EA-638A-4FAB-8A0B-ED0AE7B3F6F9/WebDeploy_amd64_en-US.msi' -OutFile $msi
+          $proc = Start-Process msiexec.exe -ArgumentList @('/i', $msi, '/quiet', '/norestart') -PassThru -Wait
+          if ($proc.ExitCode -notin 0, 3010) {
+            throw "Instalacion Web Deploy fallo con codigo $($proc.ExitCode)"
+          }
+
+      - name: Deploy via MSDeploy
+        shell: pwsh
+        env:
+          WEBSITE_NAME: ${{ secrets.WEBSITE_NAME }}
+          SERVER_COMPUTER_NAME: ${{ secrets.SERVER_COMPUTER_NAME }}
+          SERVER_USERNAME: ${{ secrets.SERVER_USERNAME }}
+          SERVER_PASSWORD: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          & ./HackerRank1/scripts/deploy-msdeploy.ps1 `
+            -PublishDir '${{ steps.prep.outputs.publish_path }}' `
+            -WebsiteName $env:WEBSITE_NAME `
+            -ServerComputerName $env:SERVER_COMPUTER_NAME `
+            -ServerUsername $env:SERVER_USERNAME `
+            -ServerPassword $env:SERVER_PASSWORD
