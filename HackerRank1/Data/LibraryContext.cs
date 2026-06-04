@@ -44,7 +44,7 @@ namespace LibraryService.WebAPI.Data
         public string Category { get; set; } = string.Empty;
 
         public int LibraryId { get; set; }
-        public virtual Library Library { get; set; } = null!;
+        public virtual Library? Library { get; set; }
     }
 
     public class Library
